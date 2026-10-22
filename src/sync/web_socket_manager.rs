@@ -78,6 +78,7 @@ struct WebSocketWorker {
     internal_receiver: Fuse<UnboundedReceiverStream<WebSocketRequest>>,
     ping_ticker: Interval,
     connection_count: u32,
+    session_id: SessionId,
     backoff: Backoff,
 }
 
@@ -152,6 +153,9 @@ impl WebSocketWorker {
             internal_receiver: UnboundedReceiverStream::new(internal_receiver).fuse(),
             ping_ticker,
             connection_count: 0,
+            // Mutation deduplication uses (session_id, request_id), so keep the session
+            // across reconnects that resend pending mutations.
+            session_id: SessionId::new(Uuid::new_v4()),
             backoff,
         };
 
@@ -225,6 +229,7 @@ impl WebSocketWorker {
         tracing::debug!("trying to {verb} to {}", self.ws_url);
         let mut internal = WebSocketInternal::new(
             self.ws_url.clone(),
+            self.session_id,
             self.connection_count,
             last_close_reason,
             max_seen_transition,
@@ -302,6 +307,7 @@ fn deprecation_message(headers: &HeaderMap) -> Option<String> {
 impl WebSocketInternal {
     async fn new(
         ws_url: Url,
+        session_id: SessionId,
         connection_count: u32,
         last_close_reason: String,
         max_observed_timestamp: Option<Timestamp>,
@@ -335,9 +341,8 @@ impl WebSocketInternal {
         };
 
         // Send an initial connect message on the new websocket
-        let session_id = Uuid::new_v4();
         let message = ClientMessage::Connect {
-            session_id: SessionId::new(session_id),
+            session_id,
             connection_count,
             last_close_reason,
             max_observed_timestamp,
