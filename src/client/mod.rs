@@ -282,6 +282,10 @@ impl ConvexClient {
     /// Perform an action `name` with `args` and return a future
     /// containing the return value of the action once it completes.
     ///
+    /// An action handed to the transport is not replayed on reconnect because
+    /// it may already have executed. A connection-loss error does not mean the
+    /// server cancelled the action or that retrying it is safe.
+    ///
     /// ```no_run
     /// # use convex::ConvexClient;
     /// # use futures::StreamExt;

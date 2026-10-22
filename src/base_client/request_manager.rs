@@ -156,14 +156,24 @@ impl RequestManager {
         rx
     }
 
-    pub fn restart(&self) -> VecDeque<ClientMessage> {
+    pub fn restart(&mut self, unsent_actions: &BTreeSet<RequestId>) -> VecDeque<ClientMessage> {
         // Sort ongoing requests by timestamp
-        let mut ordered_requests = Vec::from_iter(self.ongoing_requests.values());
+        let mut ordered_requests =
+            Vec::from_iter(std::mem::take(&mut self.ongoing_requests).into_values());
         ordered_requests.sort_by_key(|(req, _)| Reverse(req.ts));
 
         let mut messages = VecDeque::new();
-        for (request, _) in ordered_requests {
-            messages.push_back(request.message.clone());
+        for (request, sender) in ordered_requests {
+            if request.typ == RequestType::Action && !unsent_actions.contains(&request.id) {
+                // A handed-off action may already have executed. Unlike mutations,
+                // actions cannot be safely replayed after losing the connection.
+                let _ = sender.send(FunctionResult::ErrorMessage(
+                    "Connection lost while action was in flight".to_string(),
+                ));
+            } else {
+                messages.push_back(request.message.clone());
+                self.ongoing_requests.insert(request.id, (request, sender));
+            }
         }
         messages
     }

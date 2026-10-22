@@ -629,7 +629,8 @@ impl BaseConvexClient {
     ///
     /// Note that this does not *send* the message because the Internal client
     /// has no awareness of websockets. After popping the next message, it is
-    /// the caller's responsibility to actually send it.
+    /// the caller's responsibility to actually send it. A popped action is
+    /// considered in flight and will fail rather than be resent on reconnect.
     pub fn pop_next_message(&mut self) -> Option<ClientMessage> {
         self.outgoing_message_queue.pop_front()
     }
@@ -738,7 +739,25 @@ impl BaseConvexClient {
 
     /// Resend all subscribed queries and ongoing mutations. Should be used once
     /// the websocket closes and reconnects.
+    /// Actions still queued locally are sent for the first time; actions
+    /// already handed to the transport fail because their execution is
+    /// uncertain.
     pub async fn resend_ongoing_queries_mutations(&mut self) {
+        // Keep the queue intact while auth refresh can yield. If this future is
+        // cancelled and retried, queued actions still have not been handed off.
+        let state_restart_messages = self.state.restart().await;
+
+        // Only actions still in this queue are known not to have reached the
+        // transport. Preserve them across even repeated, partially drained
+        // reconnects without replaying actions whose results were lost.
+        let unsent_actions = self
+            .outgoing_message_queue
+            .iter()
+            .filter_map(|message| match message {
+                ClientMessage::Action { request_id, .. } => Some(RequestId::new(*request_id)),
+                _ => None,
+            })
+            .collect();
         // Clear any stale messages from the queue. During reconnection
         // retries, messages can accumulate from previous failed attempts
         // or from subscription changes made while disconnected. Since
@@ -747,15 +766,14 @@ impl BaseConvexClient {
         // that conflict with the fresh restart messages.
         self.outgoing_message_queue.clear();
 
-        let state_restart_messages = self.state.restart().await;
-        let mut ongoing_mutation_messages = self.request_manager.restart();
+        let mut ongoing_request_messages = self.request_manager.restart(&unsent_actions);
 
         self.remote_query_set = RemoteQuerySet::new();
         for state_restart_message in state_restart_messages {
             self.outgoing_message_queue.push_back(state_restart_message);
         }
         self.outgoing_message_queue
-            .append(&mut ongoing_mutation_messages);
+            .append(&mut ongoing_request_messages);
     }
 
     fn on_query_result_changes(
