@@ -1,6 +1,5 @@
 use std::{
     collections::BTreeMap,
-    convert::Infallible,
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -89,7 +88,7 @@ const VERSION: Option<&str> = option_env!("CARGO_PKG_VERSION");
 /// ## Examples
 /// For example code, please refer to the examples directory.
 pub struct ConvexClient {
-    listen_handle: Option<Arc<JoinHandle<Infallible>>>,
+    listen_handle: Option<Arc<JoinHandle<()>>>,
     request_sender: mpsc::UnboundedSender<ClientRequest>,
     watch_receiver: broadcast::Receiver<QueryResults>,
 }
