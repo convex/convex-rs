@@ -156,7 +156,27 @@ impl RequestManager {
         rx
     }
 
-    pub fn restart(&self) -> VecDeque<ClientMessage> {
+    /// Returns the messages to resend after a reconnect.
+    ///
+    /// Incomplete requests made before `auth_changed_at` fail instead, so they
+    /// aren't resent as a different user than the one who made them.
+    pub fn restart(&mut self, auth_changed_at: RequestId) -> VecDeque<ClientMessage> {
+        let made_before_auth_change: Vec<RequestId> = self
+            .ongoing_requests
+            .range(..auth_changed_at)
+            .filter(|(_, (request, _))| request.status != RequestStatus::Completed)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in made_before_auth_change {
+            let (_, sender) = self
+                .ongoing_requests
+                .remove(&id)
+                .expect("INTERNAL BUG: request_id must be present");
+            let _ = sender.send(FunctionResult::ErrorMessage(
+                "Authentication changed before the request completed".to_string(),
+            ));
+        }
+
         // Sort ongoing requests by timestamp
         let mut ordered_requests = Vec::from_iter(self.ongoing_requests.values());
         ordered_requests.sort_by_key(|(req, _)| Reverse(req.ts));

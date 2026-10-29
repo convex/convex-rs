@@ -119,6 +119,8 @@ struct LocalSyncState {
     latest_results: QueryResults,
     identity_version: IdentityVersion,
     auth_fetcher: Option<AuthTokenFetcher>,
+    /// The token the client last authenticated with.
+    token: AuthenticationToken,
 }
 
 impl LocalSyncState {
@@ -235,6 +237,7 @@ impl LocalSyncState {
     }
 
     fn authenticate(&mut self, token: AuthenticationToken) -> ClientMessage {
+        self.token = token.clone();
         let base_version = self.identity_version;
         self.identity_version.incr();
         ClientMessage::Authenticate {
@@ -249,22 +252,24 @@ impl LocalSyncState {
 
         // If we have a fetcher, get a fresh token for the new connection.
         if let Some(ref fetcher) = self.auth_fetcher {
-            match fetcher(true).await {
-                Ok(token) if token != AuthenticationToken::None => {
-                    messages.push(ClientMessage::Authenticate {
-                        base_version: self.identity_version,
-                        token,
-                    });
-                    self.identity_version.incr();
-                },
-                Ok(_) => {},
+            let token = match fetcher(true).await {
+                Ok(token) => token,
                 Err(e) => {
+                    // Reconnect as the same user rather than without auth.
                     tracing::error!(
-                        "Auth fetcher failed during reconnect: {e:?}. Skipping auth for this \
-                         reconnect attempt."
+                        "Auth fetcher failed during reconnect: {e:?}. Using the previous token."
                     );
+                    self.token.clone()
                 },
+            };
+            if token != AuthenticationToken::None {
+                messages.push(ClientMessage::Authenticate {
+                    base_version: self.identity_version,
+                    token: token.clone(),
+                });
+                self.identity_version.incr();
             }
+            self.token = token;
         }
 
         let mut modifications = Vec::new();
@@ -479,6 +484,8 @@ pub struct BaseConvexClient {
     optimistic_query_results: OptimisticQueryResults,
     request_manager: RequestManager,
     next_request_id: SessionRequestSeqNumber,
+    /// The first request id issued after auth last changed.
+    auth_changed_at: SessionRequestSeqNumber,
     outgoing_message_queue: VecDeque<ClientMessage>,
     max_observed_timestamp: Option<Timestamp>,
 }
@@ -498,6 +505,7 @@ impl BaseConvexClient {
             remote_query_set,
             optimistic_query_results,
             next_request_id,
+            auth_changed_at: 0,
             outgoing_message_queue: VecDeque::new(),
             max_observed_timestamp: None,
         }
@@ -603,21 +611,28 @@ impl BaseConvexClient {
     /// `force_refresh=true`.
     ///
     /// When `None` is passed the stored fetcher is cleared and auth is unset.
+    /// If the fetcher fails, auth is unset rather than left as the previous
+    /// user.
+    ///
+    /// Mutations and actions made before auth changes fail if the connection
+    /// is lost before they complete, rather than being resent as another user.
     pub async fn set_auth_fetcher(&mut self, fetcher: Option<AuthTokenFetcher>) {
         match fetcher {
             Some(fetcher) => {
-                match fetcher(false).await {
-                    Ok(token) => {
-                        let message = self.state.authenticate(token);
-                        self.outgoing_message_queue.push_back(message);
-                    },
-                    Err(e) => {
-                        tracing::error!("Auth token fetcher failed: {e:?}");
-                    },
-                }
+                // Sign out rather than keep the previous user's identity.
+                let token = fetcher(false).await.unwrap_or_else(|e| {
+                    tracing::error!("Auth token fetcher failed: {e:?}");
+                    AuthenticationToken::None
+                });
+                // Only after the fetch, so dropping this future mid-fetch
+                // leaves auth unchanged.
+                self.auth_changed_at = self.next_request_id;
+                let message = self.state.authenticate(token);
+                self.outgoing_message_queue.push_back(message);
                 self.state.auth_fetcher = Some(fetcher);
             },
             None => {
+                self.auth_changed_at = self.next_request_id;
                 self.state.auth_fetcher = None;
                 let message = self.state.authenticate(AuthenticationToken::None);
                 self.outgoing_message_queue.push_back(message);
@@ -748,7 +763,9 @@ impl BaseConvexClient {
         self.outgoing_message_queue.clear();
 
         let state_restart_messages = self.state.restart().await;
-        let mut ongoing_mutation_messages = self.request_manager.restart();
+        let mut ongoing_mutation_messages = self
+            .request_manager
+            .restart(RequestId::new(self.auth_changed_at));
 
         self.remote_query_set = RemoteQuerySet::new();
         for state_restart_message in state_restart_messages {
@@ -818,6 +835,7 @@ mod tests {
         QuerySetVersion,
         UdfPath,
     };
+    use futures::FutureExt;
     use maplit::btreemap;
 
     use super::*;
@@ -898,6 +916,110 @@ mod tests {
         // ModifyQuerySet{base_version:0}.
         simulate_server_version_check(&messages)
             .expect("Server would reject these messages with a FatalError");
+    }
+
+    fn auth_callback(token: &'static str, refresh_fails: bool) -> Option<AuthTokenFetcher> {
+        Some(Box::new(move |force_refetch| {
+            Box::pin(async move {
+                anyhow::ensure!(!(force_refetch && refresh_fails), "offline");
+                Ok(AuthenticationToken::User(token.into()))
+            })
+        }))
+    }
+
+    fn drain(client: &mut BaseConvexClient) -> Vec<ClientMessage> {
+        std::iter::from_fn(|| client.pop_next_message()).collect()
+    }
+
+    #[tokio::test]
+    async fn test_failed_auth_fetcher_signs_out() {
+        let mut client = BaseConvexClient::new();
+        client.set_auth_fetcher(auth_callback("alice", false)).await;
+        drain(&mut client);
+        client
+            .set_auth_fetcher(Some(Box::new(|_| {
+                Box::pin(async { anyhow::bail!("offline") })
+            })))
+            .await;
+        // The client doesn't stay authenticated as alice.
+        assert!(matches!(
+            drain(&mut client).as_slice(),
+            [ClientMessage::Authenticate {
+                token: AuthenticationToken::None,
+                ..
+            }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_reconnect_fails_requests_made_before_auth_changed() {
+        let mut client = BaseConvexClient::new();
+        client.set_auth_fetcher(auth_callback("alice", false)).await;
+        let mut alices = client.mutation("messages:send".parse().unwrap(), btreemap! {});
+        client.set_auth_fetcher(auth_callback("bob", false)).await;
+        let mut bobs = client.mutation("messages:send".parse().unwrap(), btreemap! {});
+
+        client.resend_ongoing_queries_mutations().await;
+        assert_eq!(
+            alices.try_recv().unwrap(),
+            FunctionResult::ErrorMessage(
+                "Authentication changed before the request completed".into()
+            )
+        );
+        assert!(bobs.try_recv().is_err());
+        // Only bob's mutation is resent, after authenticating as bob.
+        assert!(matches!(
+            drain(&mut client).as_slice(),
+            [
+                ClientMessage::Authenticate { token: AuthenticationToken::User(bob), .. },
+                ClientMessage::ModifyQuerySet { .. },
+                ClientMessage::Mutation { request_id: 1, .. },
+            ] if bob == "bob"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_dropping_set_auth_fetcher_mid_fetch_leaves_auth_unchanged() {
+        let mut client = BaseConvexClient::new();
+        client.set_auth_fetcher(auth_callback("alice", false)).await;
+        let mut result = client.mutation("messages:send".parse().unwrap(), btreemap! {});
+        let never: AuthTokenFetcher =
+            Box::new(|_| Box::pin(std::future::pending::<anyhow::Result<AuthenticationToken>>()));
+        assert!(client
+            .set_auth_fetcher(Some(never))
+            .now_or_never()
+            .is_none());
+
+        client.resend_ongoing_queries_mutations().await;
+        assert!(result.try_recv().is_err());
+        // Alice's mutation is resent as alice.
+        assert!(matches!(
+            drain(&mut client).as_slice(),
+            [
+                ClientMessage::Authenticate { token: AuthenticationToken::User(alice), .. },
+                ClientMessage::ModifyQuerySet { .. },
+                ClientMessage::Mutation { request_id: 0, .. },
+            ] if alice == "alice"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_reconnect_uses_the_cached_token_if_refreshing_fails() {
+        let mut client = BaseConvexClient::new();
+        client.set_auth_fetcher(auth_callback("alice", true)).await;
+        let mut result = client.mutation("messages:send".parse().unwrap(), btreemap! {});
+
+        client.resend_ongoing_queries_mutations().await;
+        assert!(result.try_recv().is_err());
+        // The mutation is resent as alice, not without auth.
+        assert!(matches!(
+            drain(&mut client).as_slice(),
+            [
+                ClientMessage::Authenticate { token: AuthenticationToken::User(alice), .. },
+                ClientMessage::ModifyQuerySet { .. },
+                ClientMessage::Mutation { .. },
+            ] if alice == "alice"
+        ));
     }
 
     #[tokio::test]
