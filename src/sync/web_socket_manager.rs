@@ -79,6 +79,7 @@ struct WebSocketWorker {
     ping_ticker: Interval,
     connection_count: u32,
     backoff: Backoff,
+    session_id: SessionId,
 }
 
 pub struct WebSocketManager {
@@ -153,6 +154,9 @@ impl WebSocketWorker {
             ping_ticker,
             connection_count: 0,
             backoff,
+            // N.B.: session ID is shared across reconnects, which lets the server identify retried
+            // mutations and deduplicate them
+            session_id: SessionId::new(Uuid::new_v4()),
         };
 
         let mut last_close_reason = "InitialConnect".to_string();
@@ -225,6 +229,7 @@ impl WebSocketWorker {
         tracing::debug!("trying to {verb} to {}", self.ws_url);
         let mut internal = WebSocketInternal::new(
             self.ws_url.clone(),
+            self.session_id,
             self.connection_count,
             last_close_reason,
             max_seen_transition,
@@ -302,6 +307,7 @@ fn deprecation_message(headers: &HeaderMap) -> Option<String> {
 impl WebSocketInternal {
     async fn new(
         ws_url: Url,
+        session_id: SessionId,
         connection_count: u32,
         last_close_reason: String,
         max_observed_timestamp: Option<Timestamp>,
@@ -335,9 +341,8 @@ impl WebSocketInternal {
         };
 
         // Send an initial connect message on the new websocket
-        let session_id = Uuid::new_v4();
         let message = ClientMessage::Connect {
-            session_id: SessionId::new(session_id),
+            session_id,
             connection_count,
             last_close_reason,
             max_observed_timestamp,
