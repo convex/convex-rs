@@ -422,17 +422,6 @@ impl CanonicalizedModulePath {
             is_cron: self.is_cron(),
         }
     }
-
-    #[cfg(any(test, feature = "testing"))]
-    pub fn with_cron(&self) -> Self {
-        Self {
-            path: self.path.clone(),
-            is_system: self.is_system(),
-            is_deps: self.is_deps(),
-            is_http: self.is_http(),
-            is_cron: true,
-        }
-    }
 }
 
 impl FromStr for CanonicalizedModulePath {
