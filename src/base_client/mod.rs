@@ -1060,6 +1060,67 @@ mod tests {
         );
     }
 
+    fn mutation_response(request_id: u32, ts: Timestamp) -> ServerMessage {
+        ServerMessage::MutationResponse {
+            request_id,
+            result: Ok(Value::Int64(1)),
+            ts: Some(ts),
+            log_lines: LogLinesMessage(vec![]),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reply_to_a_resent_completed_mutation_is_ignored() {
+        let mut client = BaseConvexClient::new();
+        let mut result = client.mutation("messages:send".parse().unwrap(), btreemap! {});
+        drain(&mut client);
+        let ts = Timestamp::try_from(1_i64).unwrap();
+        client.receive_message(mutation_response(0, ts)).unwrap();
+
+        // The connection drops before the transition, so the mutation is resent.
+        client.resend_ongoing_queries_mutations().await;
+        assert!(matches!(
+            drain(&mut client).as_slice(),
+            [
+                ClientMessage::ModifyQuerySet { .. },
+                ClientMessage::Mutation { request_id: 0, .. },
+            ]
+        ));
+
+        // The new connection's first transition completes the mutation, then
+        // the server's reply to the resend arrives.
+        let end_version = StateVersion {
+            ts,
+            ..StateVersion::initial()
+        };
+        client
+            .receive_message(ServerMessage::Transition {
+                start_version: StateVersion::initial(),
+                end_version,
+                modifications: vec![],
+                client_clock_skew: None,
+                server_ts: None,
+            })
+            .unwrap();
+        assert_eq!(result.try_recv().unwrap(), FunctionResult::Value(1.into()));
+        assert!(matches!(
+            client.receive_message(mutation_response(0, ts)),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn test_reply_with_the_wrong_type_for_a_tracked_request_is_an_error() {
+        let mut client = BaseConvexClient::new();
+        let _result = client.mutation("messages:send".parse().unwrap(), btreemap! {});
+        let reply = ServerMessage::ActionResponse {
+            request_id: 0,
+            result: Ok(Value::Int64(1)),
+            log_lines: LogLinesMessage(vec![]),
+        };
+        assert!(client.receive_message(reply).is_err());
+    }
+
     fn drain_add_message(client: &mut BaseConvexClient) -> QueryId {
         match client.pop_next_message() {
             Some(ClientMessage::ModifyQuerySet { modifications, .. }) => {
