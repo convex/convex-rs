@@ -78,6 +78,7 @@ struct WebSocketWorker {
     internal_receiver: Fuse<UnboundedReceiverStream<WebSocketRequest>>,
     ping_ticker: Interval,
     connection_count: u32,
+    session_id: SessionId,
     backoff: Backoff,
     session_id: SessionId,
 }
@@ -153,6 +154,9 @@ impl WebSocketWorker {
             internal_receiver: UnboundedReceiverStream::new(internal_receiver).fuse(),
             ping_ticker,
             connection_count: 0,
+            // Mutation deduplication uses (session_id, request_id), so keep the session
+            // across reconnects that resend pending mutations.
+            session_id: SessionId::new(Uuid::new_v4()),
             backoff,
             // N.B.: session ID is shared across reconnects, which lets the server identify retried
             // mutations and deduplicate them
