@@ -88,7 +88,11 @@ impl RequestManager {
         ts: Option<Timestamp>,
     ) -> Result<(), ReconnectProtocolReason> {
         let Some((request, _)) = self.ongoing_requests.get_mut(request_id) else {
-            return Err("Invalid request id from server".to_string());
+            // A request resent on reconnect may already have completed, so the
+            // server's reply to the resend arrives after the client stopped
+            // tracking it. Ignore it, like the JavaScript client does.
+            tracing::debug!("Ignoring response for untracked request {request_id:?}");
+            return Ok(());
         };
         if request.typ != request_type {
             return Err("Mismatched request type from server".to_string());
