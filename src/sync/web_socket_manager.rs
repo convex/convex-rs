@@ -179,6 +179,10 @@ impl WebSocketWorker {
                     tracing::debug!("Reconnecting websocket due to {}", reconnect.reason);
                     last_close_reason = reconnect.reason;
                     max_observed_timestamp = reconnect.max_observed_timestamp;
+                    let _ = worker
+                        .on_response
+                        .send(ProtocolResponse::ReconnectAcknowledged)
+                        .await;
                     continue;
                 },
                 Err(e) => e,
@@ -207,6 +211,10 @@ impl WebSocketWorker {
                     break;
                 }
             }
+            let _ = worker
+                .on_response
+                .send(ProtocolResponse::ReconnectAcknowledged)
+                .await;
             tracing::debug!(
                 "Base client acknowledged reconnect. Sleeping {delay:?} and reconnecting"
             );

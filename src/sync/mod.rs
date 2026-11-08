@@ -28,6 +28,10 @@ pub type ServerMessage = convex_sync_types::ServerMessage<Value>;
 pub enum ProtocolResponse {
     ServerMessage(ServerMessage),
     Failure,
+    /// Sent once per [`SyncProtocol::reconnect`] request, when the protocol
+    /// stops reading the connection it replaces. Every response before it
+    /// came from that connection.
+    ReconnectAcknowledged,
 }
 
 #[derive(Debug)]
@@ -48,5 +52,8 @@ pub trait SyncProtocol: Send + Sized {
         client_id: &str,
     ) -> anyhow::Result<Self>;
     async fn send(&mut self, message: ClientMessage) -> anyhow::Result<()>;
+    /// Queue a reconnect and return without waiting for it. Once the protocol
+    /// stops reading the current connection, it sends
+    /// [`ProtocolResponse::ReconnectAcknowledged`].
     async fn reconnect(&mut self, request: ReconnectRequest);
 }
