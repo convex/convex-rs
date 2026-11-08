@@ -678,6 +678,21 @@ impl BaseConvexClient {
                 for (id, result) in changed_query_ids {
                     self.state.latest_results.results.insert(id, result);
                 }
+                // Publish only results the server holds on this connection.
+                // After a reconnect, the first transition can come before the
+                // server answers the queries again, and the previous
+                // connection's results would otherwise be published as current.
+                let not_on_server: Vec<QueryId> = self
+                    .state
+                    .latest_results
+                    .results
+                    .keys()
+                    .filter(|id| !self.optimistic_query_results.query_results.contains_key(id))
+                    .copied()
+                    .collect();
+                for id in not_on_server {
+                    self.state.latest_results.results.remove(&id);
+                }
                 return Ok(Some(self.state.latest_results.clone()));
             },
             ServerMessage::MutationResponse {
@@ -1115,6 +1130,49 @@ mod tests {
             "query update should publish results"
         );
         *version = end_version;
+    }
+
+    #[tokio::test]
+    async fn test_reconnect_does_not_republish_results_until_the_server_answers() {
+        let mut client = BaseConvexClient::new();
+        let mut version = StateVersion::initial();
+        let subscriber_id = client.subscribe("getValue1".parse().unwrap(), BTreeMap::new());
+        let query_id = drain_add_message(&mut client);
+        apply_query_update(&mut client, &mut version, query_id, 10.into());
+
+        // The connection drops and comes back.
+        client.resend_ongoing_queries_mutations().await;
+        while client.pop_next_message().is_some() {}
+
+        // The first transition on the new connection can come before the
+        // server has answered the query again, for example when it only
+        // acknowledges re-authentication.
+        let start_version = StateVersion::initial();
+        let end_version = StateVersion {
+            identity: 1.into(),
+            ts: start_version.ts.succ().unwrap(),
+            ..start_version
+        };
+        let results = client
+            .receive_message(ServerMessage::Transition {
+                start_version,
+                end_version,
+                modifications: vec![],
+                client_clock_skew: None,
+                server_ts: None,
+            })
+            .expect("transition should be accepted")
+            .expect("transition should publish results");
+        // The previous connection's result isn't published as current.
+        assert_eq!(results.get(&subscriber_id), None);
+
+        // Once the server answers, the query has a result again.
+        let mut version = end_version;
+        apply_query_update(&mut client, &mut version, query_id, 10.into());
+        assert_eq!(
+            client.latest_results().get(&subscriber_id),
+            Some(&FunctionResult::Value(10.into()))
+        );
     }
 
     #[test]
