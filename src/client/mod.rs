@@ -479,6 +479,7 @@ pub mod tests {
         time::Duration,
     };
 
+    use anyhow::Context;
     use convex_sync_types::{
         types::SerializedArgs,
         AuthenticationToken,
@@ -512,8 +513,11 @@ pub mod tests {
         },
         sync::{
             testing::TestProtocolManager,
+            ProtocolResponse,
+            ReconnectRequest,
             ServerMessage,
             SyncProtocol,
+            WebSocketState,
         },
         value::Value,
         QuerySubscription,
@@ -914,6 +918,130 @@ pub mod tests {
             results.get(&subscription1c),
             Some(&FunctionResult::Value(10.into()))
         );
+        Ok(())
+    }
+
+    /// Never finishes sending the first query set change, like a socket that
+    /// dies while writing it. Unlike `TestProtocolManager`, it allows
+    /// reconnects and counts them.
+    #[derive(Clone, Default)]
+    struct StallingQuerySetProtocol {
+        sent: Arc<parking_lot::Mutex<Vec<ClientMessage>>>,
+        stalled: Arc<parking_lot::Mutex<bool>>,
+        reconnects: Arc<parking_lot::Mutex<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SyncProtocol for StallingQuerySetProtocol {
+        async fn open(
+            _ws_url: url::Url,
+            _on_response: mpsc::Sender<ProtocolResponse>,
+            _on_state_change: Option<mpsc::Sender<WebSocketState>>,
+            _client_id: &str,
+        ) -> anyhow::Result<Self> {
+            unimplemented!()
+        }
+
+        async fn send(&mut self, message: ClientMessage) -> anyhow::Result<()> {
+            let is_query_set = matches!(message, ClientMessage::ModifyQuerySet { .. });
+            self.sent.lock().push(message);
+            if is_query_set && !std::mem::replace(&mut *self.stalled.lock(), true) {
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+
+        async fn reconnect(&mut self, _request: ReconnectRequest) {
+            *self.reconnects.lock() += 1;
+        }
+    }
+
+    impl StallingQuerySetProtocol {
+        async fn wait_until_sent(&self, n: usize, is_wanted: impl Fn(&ClientMessage) -> bool) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while self.sent.lock().iter().filter(|m| is_wanted(m)).count() < n {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("Test timed out waiting for messages to be sent");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_sent_as_the_connection_fails_returns_the_subscription(
+    ) -> anyhow::Result<()> {
+        let protocol = StallingQuerySetProtocol::default();
+        let (response_sender, response_receiver) = mpsc::channel(1);
+        let (request_sender, request_receiver) = mpsc::unbounded_channel();
+        let (watch_sender, watch_receiver) = broadcast::channel(1);
+        let listen_handle = tokio::spawn(worker(
+            response_receiver,
+            request_receiver,
+            watch_sender,
+            BaseConvexClient::new(),
+            protocol.clone(),
+        ));
+        let client = ConvexClient {
+            listen_handle: Some(Arc::new(listen_handle)),
+            request_sender,
+            watch_receiver,
+        };
+        // Calling on a clone keeps `client`, and so the worker, alive if the
+        // call returns early.
+        let mut caller = client.clone();
+        let subscription =
+            tokio::spawn(async move { caller.subscribe("getValue1", btreemap! {}).await });
+
+        // The connection fails while the subscription is being sent.
+        protocol
+            .wait_until_sent(1, |m| matches!(m, ClientMessage::ModifyQuerySet { .. }))
+            .await;
+        response_sender.send(ProtocolResponse::Failure).await?;
+
+        // The caller gets the subscription, and it gets results once the
+        // client has reconnected and subscribed again.
+        let mut subscription = tokio::time::timeout(Duration::from_secs(5), subscription)
+            .await??
+            .context("the caller got no subscription")?;
+        let adds_the_query = |m: &ClientMessage| {
+            matches!(
+                m,
+                ClientMessage::ModifyQuerySet { modifications, .. }
+                    if matches!(
+                        &modifications[..],
+                        [QuerySetModification::Add(Query { query_id, .. })]
+                            if *query_id == QueryId::new(0)
+                    )
+            )
+        };
+        protocol.wait_until_sent(2, adds_the_query).await;
+        assert_eq!(*protocol.reconnects.lock(), 1);
+        response_sender
+            .send(ProtocolResponse::ServerMessage(
+                fake_transition(StateVersion::initial(), vec![(QueryId::new(0), 10.into())]).0,
+            ))
+            .await?;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), subscription.next()).await?,
+            Some(FunctionResult::Value(10.into()))
+        );
+
+        // Dropping it unsubscribes.
+        drop(subscription);
+        protocol
+            .wait_until_sent(1, |m| {
+                matches!(
+                    m,
+                    ClientMessage::ModifyQuerySet { modifications, .. }
+                        if matches!(
+                            modifications[..],
+                            [QuerySetModification::Remove { query_id }]
+                                if query_id == QueryId::new(0)
+                        )
+                )
+            })
+            .await;
         Ok(())
     }
 

@@ -152,14 +152,18 @@ async fn _worker_once<T: SyncProtocol>(
                         args,
                     } =  query;
                     let subscriber_id = base_client.subscribe(udf_path, args);
-                    communicate(
+                    let send_result = communicate(
                         base_client,
                         protocol_response_receiver,
                         watch_sender,
                         protocol_manager,
                     )
-                    .await?;
+                    .await;
 
+                    // The query stays subscribed, and is resubscribed after a
+                    // reconnect, even if the connection failed during the
+                    // send. Hand over the subscription either way, so the
+                    // caller can use it and dropping it unsubscribes.
                     let watch = BroadcastStream::new(watch);
                     let subscription = QuerySubscription {
                         subscriber_id,
@@ -168,6 +172,7 @@ async fn _worker_once<T: SyncProtocol>(
                         initial: base_client.latest_results().get(&subscriber_id).cloned(),
                     };
                     let _ = tx.send(subscription);
+                    send_result?;
                 },
                 ClientRequest::Mutation(mutation, tx) => {
                     let MutationRequest {
