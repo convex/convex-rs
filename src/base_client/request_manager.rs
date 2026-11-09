@@ -93,7 +93,10 @@ impl RequestManager {
         if request.typ != request_type {
             return Err("Mismatched request type from server".to_string());
         };
-        let errored = matches!(value, FunctionResult::ErrorMessage(_));
+        let errored = matches!(
+            value,
+            FunctionResult::ErrorMessage(_) | FunctionResult::ConvexError(_)
+        );
         request.update_value(value);
         request.update_timestamp(ts);
         request.status = RequestStatus::Completed;
@@ -108,16 +111,10 @@ impl RequestManager {
     pub fn remove_and_notify_completed(&mut self, ts: Timestamp) -> BTreeSet<RequestId> {
         let mut completed_requests = BTreeSet::new();
         for (id, (request, _)) in self.ongoing_requests.iter() {
-            let mut is_completed = false;
-            if request.status == RequestStatus::Completed {
-                is_completed = true;
-            }
-            if let Some(request_ts) = request.ts {
-                if request_ts <= ts {
-                    is_completed = true;
-                }
-            }
-            if is_completed {
+            // Wait until queries include the mutation's writes before resolving it.
+            if request.status == RequestStatus::Completed
+                && request.ts.is_some_and(|request_ts| request_ts <= ts)
+            {
                 completed_requests.insert(*id);
             }
         }
