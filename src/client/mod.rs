@@ -479,6 +479,7 @@ pub mod tests {
         time::Duration,
     };
 
+    use anyhow::Context;
     use convex_sync_types::{
         types::SerializedArgs,
         AuthenticationToken,
@@ -512,8 +513,11 @@ pub mod tests {
         },
         sync::{
             testing::TestProtocolManager,
+            ProtocolResponse,
+            ReconnectRequest,
             ServerMessage,
             SyncProtocol,
+            WebSocketState,
         },
         value::Value,
         QuerySubscription,
@@ -680,6 +684,154 @@ pub mod tests {
 
         test_protocol.fake_server_response(server_message).await?;
         assert_eq!(res.await??, action_result);
+        Ok(())
+    }
+
+    /// Never finishes sending the first mutation or action, like a socket
+    /// that dies while writing it. Unlike `TestProtocolManager`, it allows
+    /// reconnects and counts them.
+    #[derive(Clone, Default)]
+    struct StallingProtocol {
+        sent: Arc<parking_lot::Mutex<Vec<ClientMessage>>>,
+        stalled: Arc<parking_lot::Mutex<bool>>,
+        reconnects: Arc<parking_lot::Mutex<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SyncProtocol for StallingProtocol {
+        async fn open(
+            _ws_url: url::Url,
+            _on_response: mpsc::Sender<ProtocolResponse>,
+            _on_state_change: Option<mpsc::Sender<WebSocketState>>,
+            _client_id: &str,
+        ) -> anyhow::Result<Self> {
+            unimplemented!()
+        }
+
+        async fn send(&mut self, message: ClientMessage) -> anyhow::Result<()> {
+            let is_request = matches!(
+                message,
+                ClientMessage::Mutation { .. } | ClientMessage::Action { .. }
+            );
+            self.sent.lock().push(message);
+            if is_request && !std::mem::replace(&mut *self.stalled.lock(), true) {
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+
+        async fn reconnect(&mut self, _request: ReconnectRequest) {
+            *self.reconnects.lock() += 1;
+        }
+    }
+
+    impl StallingProtocol {
+        fn start_client(&self) -> (ConvexClient, mpsc::Sender<ProtocolResponse>) {
+            let (response_sender, response_receiver) = mpsc::channel(1);
+            let (request_sender, request_receiver) = mpsc::unbounded_channel();
+            let (watch_sender, watch_receiver) = broadcast::channel(1);
+            let listen_handle = tokio::spawn(worker(
+                response_receiver,
+                request_receiver,
+                watch_sender,
+                BaseConvexClient::new(),
+                self.clone(),
+            ));
+            let client = ConvexClient {
+                listen_handle: Some(Arc::new(listen_handle)),
+                request_sender,
+                watch_receiver,
+            };
+            (client, response_sender)
+        }
+
+        async fn wait_until_sent(&self, n: usize, is_wanted: fn(&ClientMessage) -> bool) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while self.sent.lock().iter().filter(|m| is_wanted(m)).count() < n {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("Test timed out waiting for messages to be sent");
+        }
+
+        fn assert_resent_unchanged(&self, is_wanted: fn(&ClientMessage) -> bool) {
+            let sent = self.sent.lock();
+            let requests: Vec<_> = sent.iter().filter(|m| is_wanted(m)).collect();
+            assert_eq!(requests[0], requests[1]);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mutation_sent_as_the_connection_fails_gets_its_result() -> anyhow::Result<()> {
+        let protocol = StallingProtocol::default();
+        let (client, response_sender) = protocol.start_client();
+        // Calling on a clone keeps `client`, and so the worker, alive if the
+        // call returns early.
+        let mut caller = client.clone();
+        let res =
+            tokio::spawn(async move { caller.mutation("incrementCounter", btreemap! {}).await });
+
+        // The connection fails while the mutation is being sent.
+        protocol
+            .wait_until_sent(1, |m| matches!(m, ClientMessage::Mutation { .. }))
+            .await;
+        response_sender.send(ProtocolResponse::Failure).await?;
+
+        // The client reconnects and sends the same mutation again.
+        protocol
+            .wait_until_sent(2, |m| matches!(m, ClientMessage::Mutation { .. }))
+            .await;
+        assert_eq!(*protocol.reconnects.lock(), 1);
+        protocol.assert_resent_unchanged(|m| matches!(m, ClientMessage::Mutation { .. }));
+
+        // The caller gets the server's answer to it.
+        let mutation_result = FunctionResult::Value(Value::Null);
+        let (mut_resp, transition) = fake_mutation_response(mutation_result.clone());
+        response_sender
+            .send(ProtocolResponse::ServerMessage(mut_resp))
+            .await?;
+        response_sender
+            .send(ProtocolResponse::ServerMessage(transition))
+            .await?;
+        let result = tokio::time::timeout(Duration::from_secs(5), res)
+            .await??
+            .context("the caller got no result")?;
+        assert_eq!(result, mutation_result);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_action_sent_as_the_connection_fails_gets_its_result() -> anyhow::Result<()> {
+        let protocol = StallingProtocol::default();
+        let (client, response_sender) = protocol.start_client();
+        let mut caller = client.clone();
+        let res = tokio::spawn(async move { caller.action("runAction:hello", btreemap! {}).await });
+
+        // The connection fails while the action is being sent.
+        protocol
+            .wait_until_sent(1, |m| matches!(m, ClientMessage::Action { .. }))
+            .await;
+        response_sender.send(ProtocolResponse::Failure).await?;
+
+        // The client reconnects and sends the same action again.
+        protocol
+            .wait_until_sent(2, |m| matches!(m, ClientMessage::Action { .. }))
+            .await;
+        assert_eq!(*protocol.reconnects.lock(), 1);
+        protocol.assert_resent_unchanged(|m| matches!(m, ClientMessage::Action { .. }));
+
+        // The caller gets the server's answer to it.
+        let action_result = FunctionResult::Value(Value::Null);
+        response_sender
+            .send(ProtocolResponse::ServerMessage(fake_action_response(
+                action_result.clone(),
+            )))
+            .await?;
+        let result = tokio::time::timeout(Duration::from_secs(5), res)
+            .await??
+            .context("the caller got no result")?;
+        assert_eq!(result, action_result);
         Ok(())
     }
 
