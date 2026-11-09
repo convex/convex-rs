@@ -176,6 +176,11 @@ async fn _worker_once<T: SyncProtocol>(
                     } = mutation;
                     let result_receiver = base_client
                         .mutation(udf_path, args);
+                    // The mutation is tracked now and stays tracked across a
+                    // reconnect, so hand over its result before sending it.
+                    // If the connection fails during the send, `?` returns
+                    // and would otherwise drop `tx`.
+                    let _ = tx.send(result_receiver);
                         communicate(
                             base_client,
                             protocol_response_receiver,
@@ -183,7 +188,6 @@ async fn _worker_once<T: SyncProtocol>(
                             protocol_manager,
                         )
                         .await?;
-                    let _ = tx.send(result_receiver);
                 },
                 ClientRequest::Action(action, tx) => {
                     let ActionRequest {
@@ -192,6 +196,8 @@ async fn _worker_once<T: SyncProtocol>(
                     } = action;
                     let result_receiver = base_client
                         .action(udf_path, args);
+                    // Same as for a mutation above.
+                    let _ = tx.send(result_receiver);
                         communicate(
                             base_client,
                             protocol_response_receiver,
@@ -199,7 +205,6 @@ async fn _worker_once<T: SyncProtocol>(
                             protocol_manager,
                         )
                         .await?;
-                    let _ = tx.send(result_receiver);
                 },
                 ClientRequest::Unsubscribe(unsubscribe) => {
                     let UnsubscribeRequest {subscriber_id} = unsubscribe;
