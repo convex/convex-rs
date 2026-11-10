@@ -3,6 +3,9 @@
 - Breaking change: Added the error types `InvalidPathComponentError`,
   `InvalidModulePathError`, and `CanonicalModulePathError` replacing some uses
   of `anyhow::Error`
+- The auth callback from `set_auth_callback` is called again shortly before
+  the token it returned expires, like the JS client, instead of only on
+  reconnect
 
 # 0.10.4
 

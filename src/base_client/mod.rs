@@ -12,6 +12,12 @@ use std::{
     },
     future::Future,
     pin::Pin,
+    time::{
+        Duration,
+        Instant,
+        SystemTime,
+        UNIX_EPOCH,
+    },
 };
 
 use convex_sync_types::{
@@ -58,12 +64,40 @@ pub use query_result::{
 use self::request_manager::RequestType;
 
 /// A callback that fetches an auth token. The `bool` parameter indicates
-/// whether a forced refresh is requested (e.g. on websocket reconnect).
+/// whether a forced refresh is requested (e.g. on websocket reconnect, or
+/// shortly before the current token expires).
 pub type AuthTokenFetcher = Box<
     dyn Fn(bool) -> Pin<Box<dyn Future<Output = anyhow::Result<AuthenticationToken>> + Send>>
         + Send
         + Sync,
 >;
+
+/// How long before a JWT expires to fetch a fresh one, matching the JS
+/// client's default `refreshTokenLeewaySeconds`.
+const TOKEN_REFRESH_LEEWAY_SECS: u64 = 10;
+
+/// How long from `now` until `token` should be refreshed, based on its `iat`
+/// and `exp` claims. `None` if it isn't a JWT with both claims, or lives too
+/// briefly to refresh ahead of its expiry.
+fn token_refresh_delay(token: &AuthenticationToken, now: SystemTime) -> Option<Duration> {
+    let AuthenticationToken::User(jwt) = token else {
+        return None;
+    };
+    let payload = base64::decode_config(jwt.split('.').nth(1)?, base64::URL_SAFE_NO_PAD).ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    let (iat, exp) = (claims["iat"].as_u64()?, claims["exp"].as_u64()?);
+    let lifetime = exp.checked_sub(iat)?;
+    if lifetime <= TOKEN_REFRESH_LEEWAY_SECS {
+        return None;
+    }
+    // A cached token may have been issued a while ago.
+    let remaining = exp.saturating_sub(now.duration_since(UNIX_EPOCH).ok()?.as_secs());
+    Some(Duration::from_secs(
+        lifetime
+            .min(remaining)
+            .saturating_sub(TOKEN_REFRESH_LEEWAY_SECS),
+    ))
+}
 
 #[derive(Clone, Eq, PartialEq, PartialOrd, Ord, Debug)]
 struct QueryToken(String);
@@ -121,6 +155,8 @@ struct LocalSyncState {
     auth_fetcher: Option<AuthTokenFetcher>,
     /// The token the client last authenticated with.
     token: AuthenticationToken,
+    /// When to fetch a fresh token, ahead of `token` expiring.
+    token_refresh_at: Option<Instant>,
 }
 
 impl LocalSyncState {
@@ -237,13 +273,19 @@ impl LocalSyncState {
     }
 
     fn authenticate(&mut self, token: AuthenticationToken) -> ClientMessage {
-        self.token = token.clone();
+        self.set_token(token.clone());
         let base_version = self.identity_version;
         self.identity_version.incr();
         ClientMessage::Authenticate {
             base_version,
             token,
         }
+    }
+
+    fn set_token(&mut self, token: AuthenticationToken) {
+        self.token_refresh_at =
+            token_refresh_delay(&token, SystemTime::now()).map(|delay| Instant::now() + delay);
+        self.token = token;
     }
 
     async fn restart(&mut self) -> Vec<ClientMessage> {
@@ -269,7 +311,7 @@ impl LocalSyncState {
                 });
                 self.identity_version.incr();
             }
-            self.token = token;
+            self.set_token(token);
         }
 
         let mut modifications = Vec::new();
@@ -637,6 +679,31 @@ impl BaseConvexClient {
                 let message = self.state.authenticate(AuthenticationToken::None);
                 self.outgoing_message_queue.push_back(message);
             },
+        }
+    }
+
+    /// When [`BaseConvexClient::refresh_auth`] should be called, shortly
+    /// before the current JWT expires.
+    pub fn auth_refresh_at(&self) -> Option<Instant> {
+        self.state.token_refresh_at
+    }
+
+    /// Fetch a fresh token with `force_refresh=true` and authenticate with it
+    /// if it changed.
+    pub async fn refresh_auth(&mut self) {
+        self.state.token_refresh_at = None;
+        let Some(fetcher) = &self.state.auth_fetcher else {
+            return;
+        };
+        match fetcher(true).await {
+            Ok(token) if token != self.state.token => {
+                let message = self.state.authenticate(token);
+                self.outgoing_message_queue.push_back(message);
+            },
+            Ok(_) => {},
+            // Once the token expires, the server's AuthError makes the client
+            // reconnect, which fetches a token again.
+            Err(e) => tracing::error!("Auth fetcher failed during refresh: {e:?}"),
         }
     }
 
@@ -1019,6 +1086,77 @@ mod tests {
                 ClientMessage::ModifyQuerySet { .. },
                 ClientMessage::Mutation { .. },
             ] if alice == "alice"
+        ));
+    }
+
+    fn jwt(iat: u64, exp: u64) -> String {
+        let claims = base64::encode_config(
+            json!({ "iat": iat, "exp": exp }).to_string(),
+            base64::URL_SAFE_NO_PAD,
+        );
+        format!("header.{claims}.signature")
+    }
+
+    #[test]
+    fn test_token_refresh_delay() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let delay = |iat, exp| token_refresh_delay(&AuthenticationToken::User(jwt(iat, exp)), now);
+        // A fresh token is refreshed 10 seconds before it expires.
+        assert_eq!(delay(1_000_000, 1_003_600), Some(Duration::from_secs(3590)));
+        // A cached token is refreshed based on the time it has left.
+        assert_eq!(delay(990_000, 1_000_100), Some(Duration::from_secs(90)));
+        assert_eq!(delay(990_000, 999_000), Some(Duration::ZERO));
+        // Tokens that aren't scheduled for a refresh.
+        assert_eq!(delay(1_000_000, 1_000_005), None);
+        assert_eq!(
+            token_refresh_delay(&AuthenticationToken::User("opaque".into()), now),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refresh_auth_authenticates_with_the_fresh_token() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let cached = jwt(now - 3000, now + 600);
+        let fresh = jwt(now, now + 3600);
+        let mut client = BaseConvexClient::new();
+        let fresh_token = fresh.clone();
+        client
+            .set_auth_fetcher(Some(Box::new(move |force_refetch| {
+                let token = if force_refetch { &fresh_token } else { &cached };
+                let token = AuthenticationToken::User(token.clone());
+                Box::pin(async move { Ok(token) })
+            })))
+            .await;
+        assert!(client.auth_refresh_at().unwrap() <= Instant::now() + Duration::from_secs(590));
+        let mut result = client.mutation("messages:send".parse().unwrap(), btreemap! {});
+        drain(&mut client);
+
+        client.refresh_auth().await;
+        assert!(matches!(
+            drain(&mut client).as_slice(),
+            [ClientMessage::Authenticate { token: AuthenticationToken::User(token), .. }]
+                if token == &fresh
+        ));
+        assert!(client.auth_refresh_at().unwrap() > Instant::now() + Duration::from_secs(3500));
+
+        // Refreshing to the same token doesn't reauthenticate.
+        client.refresh_auth().await;
+        assert!(drain(&mut client).is_empty());
+
+        // The refresh didn't change the user, so the mutation is resent.
+        client.resend_ongoing_queries_mutations().await;
+        assert!(result.try_recv().is_err());
+        assert!(matches!(
+            drain(&mut client).as_slice(),
+            [
+                ClientMessage::Authenticate { .. },
+                ClientMessage::ModifyQuerySet { .. },
+                ClientMessage::Mutation { request_id: 0, .. },
+            ]
         ));
     }
 
