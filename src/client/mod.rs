@@ -383,6 +383,9 @@ impl ConvexClient {
     /// again on every websocket reconnect (with `force_refresh=true`),
     /// allowing dynamic token refresh.
     ///
+    /// If the token is a JWT with `iat` and `exp` claims, the callback is also
+    /// invoked (with `force_refresh=true`) 10 seconds before it expires.
+    ///
     /// Pass `None` to clear the callback and log out.
     pub async fn set_auth_callback(&mut self, fetcher: Option<AuthTokenFetcher>) {
         self.request_sender
