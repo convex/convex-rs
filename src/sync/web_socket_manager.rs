@@ -59,6 +59,11 @@ use crate::sync::{
 
 const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const MAX_BACKOFF: Duration = Duration::from_secs(15);
+/// How long opening a WebSocket may take, from the TCP connect to sending the
+/// connect message. Without a limit, a handshake whose reply never arrives
+/// leaves the client connecting until the socket itself errors, which can take
+/// hours.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 #[derive(Debug)]
@@ -80,6 +85,7 @@ struct WebSocketWorker {
     connection_count: u32,
     backoff: Backoff,
     session_id: SessionId,
+    connect_timeout: Duration,
 }
 
 pub struct WebSocketManager {
@@ -107,6 +113,7 @@ impl SyncProtocol for WebSocketManager {
             on_state_change,
             internal_receiver,
             client_id.to_string(),
+            CONNECT_TIMEOUT,
         ));
 
         Ok(WebSocketManager {
@@ -142,6 +149,7 @@ impl WebSocketWorker {
         on_state_change: Option<mpsc::Sender<WebSocketState>>,
         internal_receiver: mpsc::UnboundedReceiver<WebSocketRequest>,
         client_id: String,
+        connect_timeout: Duration,
     ) -> Infallible {
         let ping_ticker = tokio::time::interval(Self::HEARTBEAT_INTERVAL);
         let backoff = Backoff::new(INITIAL_BACKOFF, MAX_BACKOFF);
@@ -157,6 +165,7 @@ impl WebSocketWorker {
             // N.B.: session ID is shared across reconnects, which lets the server identify retried
             // mutations and deduplicate them
             session_id: SessionId::new(Uuid::new_v4()),
+            connect_timeout,
         };
 
         let mut last_close_reason = "InitialConnect".to_string();
@@ -227,15 +236,19 @@ impl WebSocketWorker {
             "reconnect"
         };
         tracing::debug!("trying to {verb} to {}", self.ws_url);
-        let mut internal = WebSocketInternal::new(
-            self.ws_url.clone(),
-            self.session_id,
-            self.connection_count,
-            last_close_reason,
-            max_seen_transition,
-            client_id,
+        let mut internal = tokio::time::timeout(
+            self.connect_timeout,
+            WebSocketInternal::new(
+                self.ws_url.clone(),
+                self.session_id,
+                self.connection_count,
+                last_close_reason,
+                max_seen_transition,
+                client_id,
+            ),
         )
-        .await?;
+        .await
+        .map_err(|_| anyhow::anyhow!("ConnectTimeout"))??;
         tracing::debug!("completed websocket {verb} to {}", self.ws_url);
         if let Some(state_change_sender) = &self.on_state_change {
             let _ = state_change_sender.try_send(WebSocketState::Connected);
@@ -364,5 +377,61 @@ impl WebSocketInternal {
             .send(message)
             .await
             .context("WebsocketClosedOnSend")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::{
+        net::TcpListener,
+        sync::mpsc,
+        time::timeout,
+    };
+    use url::Url;
+
+    use super::{
+        WebSocketRequest,
+        WebSocketWorker,
+    };
+    use crate::sync::{
+        ProtocolResponse,
+        ReconnectRequest,
+    };
+
+    /// A server that accepts the TCP connection but never answers the
+    /// WebSocket handshake must not leave the client connecting forever.
+    #[tokio::test]
+    async fn test_stalled_handshake_times_out_and_reconnects() -> anyhow::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let ws_url: Url = format!("ws://{}/api/sync", listener.local_addr()?).parse()?;
+        let (on_response, mut responses) = mpsc::channel(8);
+        let (requests, internal_receiver) = mpsc::unbounded_channel();
+        let worker = tokio::spawn(WebSocketWorker::run(
+            ws_url,
+            on_response,
+            None,
+            internal_receiver,
+            "test".to_string(),
+            Duration::from_millis(200),
+        ));
+
+        // Hold the first connection open without replying to the handshake.
+        let (_first, _) = timeout(Duration::from_secs(5), listener.accept()).await??;
+
+        // The worker gives up on the connect and reports the failure.
+        let response = timeout(Duration::from_secs(5), responses.recv()).await?;
+        assert!(matches!(response, Some(ProtocolResponse::Failure)));
+
+        // Once the reconnect is acknowledged, it connects again.
+        requests.send(WebSocketRequest::Reconnect(ReconnectRequest {
+            reason: "test".to_string(),
+            max_observed_timestamp: None,
+        }))?;
+        timeout(Duration::from_secs(5), listener.accept()).await??;
+
+        worker.abort();
+        Ok(())
     }
 }
