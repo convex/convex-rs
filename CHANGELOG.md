@@ -3,6 +3,9 @@
 - Breaking change: Added the error types `InvalidPathComponentError`,
   `InvalidModulePathError`, and `CanonicalModulePathError` replacing some uses
   of `anyhow::Error`
+- Time out opening the WebSocket after 15 seconds, so a handshake whose reply
+  never arrives no longer leaves the client connecting indefinitely
+  (https://github.com/convex/convex-rs/issues/27)
 
 # 0.10.4
 
