@@ -17,6 +17,7 @@ use crate::{
 ///
 /// The function returns a Convex value or an error message string.
 #[derive(Clone, Eq, PartialEq)]
+#[must_use]
 pub enum FunctionResult {
     /// The Convex value returned on a successful run of a Convex function
     Value(Value),
