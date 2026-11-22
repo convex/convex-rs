@@ -1,7 +1,10 @@
 use std::{
     collections::BTreeMap,
     convert::Infallible,
-    time::Duration,
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
 use convex_sync_types::{
@@ -146,9 +149,20 @@ async fn _worker_once<T: SyncProtocol>(
     )
     .await?;
 
+    let auth_refresh_at = base_client.auth_refresh_at();
     tokio::select! {
         Some(protocol_response) = protocol_response_receiver.recv() => {
             handle_protocol_response(base_client, watch_sender, protocol_response)?;
+        }
+        _ = sleep_until(auth_refresh_at) => {
+            base_client.refresh_auth().await;
+            communicate(
+                base_client,
+                protocol_response_receiver,
+                watch_sender,
+                protocol_manager,
+            )
+            .await?;
         }
         Some(client_request) = client_request_receiver.recv() => {
             match client_request {
@@ -236,6 +250,13 @@ async fn _worker_once<T: SyncProtocol>(
         else => (),
     }
     Ok(())
+}
+
+async fn sleep_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Flush all messages to the protocol while processing server mesages.
